@@ -1,15 +1,19 @@
 """
-Autoplayer (87 Lines long):
-scores 6379 with a block lookahead on seed 42
-scores 5523 without the block lookahead on seed 42
+Fix lookahead!
+Produces a bit too many holes
+Old versions of player do their best on 3rd server test whereas the newer ones
+do their worst
 
-Problems:
-AI "rushes" decisions towards end of game
-Tends to wait for an I block to fill out end columns - risky
+Extra criteria:
+Pits
+Deepest pit
+Max height
+Lowest height
+Average height
 """
-from board import Direction, Rotation
+from board import Direction, Rotation, Block
 from exceptions import NoBlockException #added in
-from random import Random
+from random import Random, uniform
 
 class Player:
     def choose_action(self, board):
@@ -30,69 +34,69 @@ class RandomPlayer(Player):
 
 class Autoplayer(Player):
     def __init__(self, seed=None):
-        self.scores = [0, 100, 400, 800, 1600]
         #weightings for scoring criteria
-       # self.multipliers = (1.6, -3.78, -0.6, -2.31)
-        self.multipliers = (0.760666, -0.510066, -0.184483, -0.35663)#, -0.15147)
-        self.looked = False #if we've already looked ahead at the next block
-    
+        #below gets 187k locally on seed 42
+        self.weightings = [0.8501569803801292, -0.7952277302774627, -0.17342645892226724, -0.44814605914847927]
+        #self.weightings = (0.760666, -0.510066, -0.184483, -0.35663)
+        self.looked = False #flag indicating if we've already looked at next block
+        
     def choose_action(self, board, look_ahead=False):
-        #vars representing the best possible sequence of moves to make
-        best_x, best_rot, best_score, best_dir = 0, 0, -999999999999999999, None
-        score = 0
-        for rot in range(0, 4):
-           for x in range(board.width//2+1):
-               for mov_dir in (Direction.Left, Direction.Right): 
-                    score = self.test_move(board, x, rot, mov_dir)
-                    if score > best_score:
-                        best_x,best_rot,best_score,best_dir=x,rot,score,mov_dir
-        self.looked = False # reset flag so we can lookahead for the next block
-        best_move = [best_dir]*abs(best_x)+[Rotation.Clockwise]*best_rot
+        self.best_offset, self.best_rot, self.best_score = 0, 0, -9999999999999999
+        for rot in range(4):
+            for x_offset in range(-board.width//2, board.width//2):
+                score = self.test_move(board, rot, x_offset)
+                self.compare_scores(score, x_offset, rot)
+        self.looked = False #reset flag for not block
+        mov_dir = self.get_mov_dir(self.best_offset)
+        best_move=[Rotation.Clockwise]*self.best_rot+[mov_dir]*abs(self.best_offset)
         best_move.append(Direction.Drop) #build list of best possible moves
-        if look_ahead: return score #lookahead only cares about score, not moves
-        if board.score > 6100: #checking if height function works
-            heights, total_height = self.get_height(board)
-            print(heights)
-        return best_move #fingers crossed it's actually the best move!
-      
-    def test_move(self, board, x, rot, mov_dir):
-        dropped = False #have we already dropped the block?
-        rows_removed = 0
+        if look_ahead: return self.best_score #lookahead is only concerned with score
+        return best_move
+        
+    def test_move(self, board, rot, x_offset):
+        mov_land = False
         test_board = board.clone()
-        try:
-            rows_removed = self.place_block(test_board, test_board.rotate,
-                                            Rotation.Clockwise,rot,rows_removed)
-            rows_removed = self.place_block(test_board, test_board.move,
-                                            mov_dir, x, rows_removed)
-            if not dropped: test_board.move(Direction.Drop)
-        except NoBlockException: pass #occurs when a block has landed and we
-        #try to access it when it has become None
-        #uncomment if you want to disable the lookahead
+        score_before = test_board.score
+        rot_land = self.place_block(board, test_board.rotate, rot, Rotation.Clockwise)
+        """if we're not trying to move the block by 0 and the rotations have not
+        caused the falling block to land, proceed to move the block"""
+        if x_offset != 0 and not rot_land:
+            mov_land = self.place_block(board, test_board.move, x_offset,
+                             self.get_mov_dir(x_offset))
+        """
+        once the block drops, the next block is made to fall but a new
+        next block is not assigned as we only have a 1 block lookahead
+        If the rotations or movements have not caused the block to land
+        proceed to drop it, otherwise this would throw a NoBlockException
+        """
+        if not (mov_land or rot_land):
+            test_board.move(Direction.Drop) #the block does land after this
+        score_after = test_board.score
+        rows_removed = self.get_rows_removed(score_before, score_after)
         #return self.score_move(test_board, rows_removed)
-        return (self.score_move(test_board, rows_removed)+
+        return (self.score_move(test_board,rows_removed)+
                 self.lookahead(test_board))
-
+            
     def score_move(self, board, rows_removed):
         """
-        In tetris, to keep the game going as long as possible:
-            1: Eliminate as many rows as possible (in one go)
+        In tetris, to keep the game going as long as xsible:
+            1: Eliminate as many rows as xsible (in one go)
             2: Keep total row height as low as possible
             3: Try and keep all rows at a similar height
             4: Avoid holes that can't be filled in without clearing rows
             (5): Avoid leaving excessive pits that can only be filled in by
                  the rectangular block - in progress
         The scoring system is then based on these 4 criteria,
-            - The multipliers used are a result of trial and error
+            - The weightings used are a result of trial and error
         """
         score = 0
-        cols, total_height = self.get_height(board)
-        height_variation = self.get_variation(board, cols)
+        column_heights = self.get_height(board)
+        total_height = sum(column_heights)
+        height_variation = self.get_variation(column_heights)
         num_of_holes = self.get_holes(board)
-        num_of_pits = self.get_pits(board, cols)
         #reduces number of lines code takes
-        var_list = (rows_removed, total_height, height_variation, num_of_holes)#,
-                    #num_of_pits)
-        for multiplier, var in zip(self.multipliers, var_list):
+        var_list = (rows_removed, total_height, height_variation, num_of_holes)
+        for multiplier, var in zip(self.weightings, var_list):
             score += multiplier * var
         return score
 
@@ -101,58 +105,71 @@ class Autoplayer(Player):
         Lookahead to the next block and compute its score
         """
         score = 0
+      #  print(board.falling)
+      #  input()
         if not self.looked: #if we haven't already looked ahead
             self.looked = True
             score = self.choose_action(board.clone(), True)
         return score
     
-    def place_block(self, board, action, direction, x, rows_removed):
+    def compare_scores(self, score, x, rot):
+        """
+        Update class variables if the current move produced a better score
+        than the current best move
+        """
+        if score > self.best_score:
+            self.best_offset = x
+            self.best_rot = rot
+            self.best_score = score
+
+    def get_mov_dir(self, x): #get direction based on x offset
+        if x < 0: return Direction.Left
+        elif x > 0: return Direction.Right
+        
+    def get_rows_removed(self, before, after):
+        """
+        Calculate the number of rows removed based on the score increase
+        """
+        score_change = after - before
+        if 105 < score_change < 130: return 1
+        elif 400 < score_change < 445: return 2
+        elif 805 < score_change < 855: return 3
+        elif 1600 < score_change < 1650: return 4
+        else: return 0
+
+    def place_block(self, board, action, x, direction):
         """
         Helper function to either move or rotate then calculate how many rows
         it removed - reduces code repetitiveness
         """
-        for m in range(0, x):
-            score_before = board.score
+        for move in range(abs(x)):
             landed = action(direction)
-            score_after = board.score
-            rows_removed += self.get_rows_removed(score_before, score_after)
-            if landed: break
-        return rows_removed
-
-    def get_rows_removed(self, before, after):
-        """
-        Calculate the number of rows removed based on the score increase
-        """     
-        rows_removed = 0
-        score_increase = after - before
-        if score_increase in self.scores and score_increase > 0:
-            rows_removed += self.scores.index(score_increase)
-        return rows_removed
-
-    def get_height(self, board): #fix - max height seems to be 21
+            #optimising
+            if landed: return True
+            #we can still drop the block, we just can't move/rotate it any
+            #further to the left of right
+            if board.falling.right == 9: return False
+            if board.falling.left == 0: return False
+        
+    def get_height(self, board):
         """
         Return the total height of blocks on the board
         """
-        total_height = 0
-        cols = [0] * board.width #list of heights of each column
+        column_heights = [0]*board.width#list to store of heights of each column
         for x in range(board.width):
             for y in range(board.height):
                 if (x, y) in board.cells:
-                    #point (0, 0) is in the top left corner so invert:
-                    cols[x] = board.height - y
-                    total_height += board.height - y
+                    column_heights[x] = board.height - y
                     break #highest block already found so end this y iteration
+        return column_heights
 
-        return cols, total_height
-
-    def get_variation(self, board, cols):
+    def get_variation(self, cols):
         """
         Get the total variation in height between adjacent columns which
         represents the bumpiness of the board
-        """  
+        """ 
         variation = 0
-        #pairwise subtraction
-        for m, n in  zip(cols, cols[1:]):
+        for m, n in  zip(cols, cols[1:]): #pairwise subtraction
             variation += abs(m - n)
         return variation
     
@@ -162,23 +179,10 @@ class Autoplayer(Player):
         A hole is defined as an empty space with at least one block on top of it
         """   
         num_of_holes = 0
-        for x in range(board.width):
-            for y in range(board.height):
-                #point (0, 0) is in the top left corner so cell above y is y-1:
+        for y in range(board.height):
+            for x in range(board.width):
                 if (x, y) not in board.cells and (x, y-1) in board.cells:
                    num_of_holes += 1
         return num_of_holes
-
-    def get_pits(self, board, cols):
-        """
-        Get the number of pits continuing with this move will produce
-        A pit is defined as a single column which is at least 4 blocks lower
-        in height than its neighbours
-        """
-        pit_count = 0
-        for col, next_col in zip(cols, cols[1:]):
-            if abs(next_col - col) >= 4:
-                pit_count += 1
-        return pit_count
         
 SelectedPlayer = Autoplayer
